@@ -12,7 +12,7 @@ app.use((req, res, next) => {
   next();
 });
 
-const CONNECTION_STRING = process.env.MONGODB_URI || "mongodb+srv://chima98:Chimaroke135@unique.xxejy.mongodb.net/finflow";
+const CONNECTION_STRING = process.env.MONGODB_URI ||;
 const sseClients = new Map(); // sessionId -> res
 const pendingById = new Map(); // request id -> sessionId
 
