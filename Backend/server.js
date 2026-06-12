@@ -12,7 +12,7 @@ app.use((req, res, next) => {
   next();
 });
 
-const CONNECTION_STRING = process.env.MONGODB_URI ||;
+const CONNECTION_STRING = process.env.MONGODB_URI
 const sseClients = new Map(); // sessionId -> res
 const pendingById = new Map(); // request id -> sessionId
 
