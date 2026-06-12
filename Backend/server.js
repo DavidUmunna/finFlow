@@ -12,16 +12,62 @@ app.use((req, res, next) => {
   next();
 });
 
-const CONNECTION_STRING = process.env.MONGODB_URI || "mongodb+srv://user:pass@cluster.mongodb.net/finflow";
-const sessions = new Map();
+const CONNECTION_STRING = process.env.MONGODB_URI || "mongodb+srv://chima98:Chimaroke135@unique.xxejy.mongodb.net/finflow";
+const sseClients = new Map(); // sessionId -> res
+const pendingById = new Map(); // request id -> sessionId
 
-function spawnMCP() {
-  return spawn("npx", ["-y", "@mongodb-js/mongodb-mcp-server", "--connectionString", CONNECTION_STRING], {
+// --- Single persistent MCP process ---
+let mcp;
+let buffer = "";
+
+function startMCP() {
+  mcp = spawn("npx", ["-y", "@mongodb-js/mongodb-mcp-server", "--connectionString", CONNECTION_STRING], {
     stdio: ["pipe", "pipe", "pipe"],
   });
+
+  mcp.stdout.on("data", (chunk) => {
+    buffer += chunk.toString();
+    const lines = buffer.split("\n");
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      console.log("[MCP →]", line);
+
+      let targetSessionId = null;
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.id !== undefined && pendingById.has(parsed.id)) {
+          targetSessionId = pendingById.get(parsed.id);
+          pendingById.delete(parsed.id);
+        }
+      } catch {
+        // not JSON (e.g. notifications) — broadcast to all
+      }
+
+      if (targetSessionId) {
+        const res = sseClients.get(targetSessionId);
+        if (res) res.write(`data: ${line}\n\n`);
+      } else {
+        for (const res of sseClients.values()) {
+          res.write(`data: ${line}\n\n`);
+        }
+      }
+    }
+  });
+
+  mcp.stderr.on("data", (d) => console.error("[MCP stderr]", d.toString()));
+
+  mcp.on("close", (code) => {
+    console.error(`[MCP] process exited with code ${code}, restarting...`);
+    setTimeout(startMCP, 1000);
+  });
+
+  console.log("[MCP] persistent process started");
 }
 
-// SSE endpoint — each connection gets its own MCP process
+startMCP();
+
+// SSE endpoint — clients attach to the shared MCP process
 app.get("/sse", (req, res) => {
   const sessionId = randomUUID();
   console.log(`[session ${sessionId}] SSE connected`);
@@ -31,69 +77,42 @@ app.get("/sse", (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders();
 
-  const mcp = spawnMCP();
-  const pending = new Map(); // id → res (not used in SSE but tracks inflight)
-
-  sessions.set(sessionId, { mcp, res });
-
-  // Forward MCP stdout → SSE
-  let buffer = "";
-  mcp.stdout.on("data", (chunk) => {
-    buffer += chunk.toString();
-    const lines = buffer.split("\n");
-    buffer = lines.pop();
-    for (const line of lines) {
-      if (line.trim()) {
-        console.log(`[session ${sessionId}] MCP →`, line);
-        res.write(`data: ${line}\n\n`);
-      }
-    }
-  });
-
-  mcp.stderr.on("data", (d) => console.error(`[session ${sessionId}] stderr:`, d.toString()));
-
-  mcp.on("close", () => {
-    console.log(`[session ${sessionId}] MCP process closed`);
-    sessions.delete(sessionId);
-    res.end();
-  });
+  sseClients.set(sessionId, res);
 
   req.on("close", () => {
     console.log(`[session ${sessionId}] Client disconnected`);
-    mcp.kill();
-    sessions.delete(sessionId);
+    sseClients.delete(sessionId);
   });
 
-  // Send sessionId to client
   res.write(`event: endpoint\ndata: /message?sessionId=${sessionId}\n\n`);
-  // Keep-alive ping every 15 seconds
-    const keepAlive = setInterval(() => {
+
+  const keepAlive = setInterval(() => {
     res.write(`: ping\n\n`);
   }, 15000);
-  
-  req.on("close", () => {
-    clearInterval(keepAlive);
-  });
+
+  req.on("close", () => clearInterval(keepAlive));
 });
 
-// Message endpoint — route to correct MCP process by sessionId
+// Message endpoint — write to the shared MCP process, track which session expects the reply
 app.post("/message", (req, res) => {
   const { sessionId } = req.query;
-  const session = sessions.get(sessionId);
-
-  if (!session) {
+  if (!sseClients.has(sessionId)) {
     console.error(`[message] No session found: ${sessionId}`);
     return res.status(404).json({ error: "Session not found" });
   }
 
+  if (req.body?.id !== undefined) {
+    pendingById.set(req.body.id, sessionId);
+  }
+
   const msg = JSON.stringify(req.body);
   console.log(`[session ${sessionId}] → MCP:`, msg);
-  session.mcp.stdin.write(msg + "\n");
+  mcp.stdin.write(msg + "\n");
   res.sendStatus(202);
 });
 
 // Health check
-app.get("/health", (req, res) => res.json({ status: "ok", sessions: sessions.size }));
+app.get("/health", (req, res) => res.json({ status: "ok", sessions: sseClients.size }));
 
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => {
